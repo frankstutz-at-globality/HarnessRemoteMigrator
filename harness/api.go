@@ -498,39 +498,48 @@ func (f *FileStoreContent) DownloadFile(api *APIRequest, account, org, project, 
 		SetPathParam("id", f.Identifier).
 		Get(api.BaseURL + "/ng/api/file-store/files/{id}/download")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to download file %s: %w", f.Name, err)
 	}
 
 	if resp.StatusCode() != 200 {
 		ar := ApiResponse{}
 		err = json.Unmarshal(resp.Body(), &ar)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to parse error response for file %s: %w", f.Name, err)
 		}
 		errMsg := fmt.Sprintf("CorrelationId: %s, ResponseMessages: %+v", ar.CorrelationID, ar.ResponseMessages)
 		if !strings.Contains(errMsg, "Downloading folder not supported") {
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("API error downloading file %s: %s", f.Name, errMsg)
 		}
+		// Skip folder downloads
+		return nil
 	}
 
+	// Skip files without extension (likely folders)
 	if !strings.Contains(f.Path, ".") {
 		return nil
 	}
 
-	err = os.MkdirAll(filepath.Dir("./filestore/filestore/"+folder+f.Path), 0755)
+	// ALL files must go into ./filestore/filestore/org/project/ structure ONLY
+	// Nothing should go outside the filestore/ subdirectory within the cloned repo
+	// The folder parameter contains the org/project structure from the download calls
+	targetPath := "./filestore/filestore" + folder + f.Path
+	targetDir := filepath.Dir(targetPath)
+
+	err = os.MkdirAll(targetDir, 0755)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 	}
 
-	out, err := os.Create("./filestore/filestore/" + folder + f.Path)
+	out, err := os.Create(targetPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create file %s: %w", targetPath, err)
 	}
 	defer out.Close()
 
 	_, err = out.Write(resp.Body())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to write content to file %s: %w", targetPath, err)
 	}
 
 	return nil

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/aleksa11010/HarnessInlineToRemote/harness"
@@ -15,6 +17,24 @@ import (
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
+
+// Version information - can be set at build time via ldflags
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
+	GoVersion = runtime.Version()
+)
+
+// printVersion displays version information
+func printVersion() {
+	fmt.Printf("Harness Remote Migrator\n")
+	fmt.Printf("Version:     %s\n", Version)
+	fmt.Printf("Git Commit:  %s\n", GitCommit)
+	fmt.Printf("Build Date:  %s\n", BuildDate)
+	fmt.Printf("Go Version:  %s\n", GoVersion)
+	fmt.Printf("OS/Arch:     %s/%s\n", runtime.GOOS, runtime.GOARCH)
+}
 
 func main() {
 
@@ -50,8 +70,15 @@ func main() {
 	prod3 := flag.Bool("prod3", false, "User Prod3 base URL for API calls")
 	customGitDetailsFilePath := flag.String("custom-remote-path", "", "A custom file path where to save remote manifests.")
 	gitX := flag.Bool("gitx", false, "Migrate entity following the Git Experience definitions")
+	versionFlag := flag.Bool("version", false, "Show version information")
 
 	flag.Parse()
+
+	// Handle version flag
+	if *versionFlag {
+		printVersion()
+		return
+	}
 
 	type MigrationScope struct {
 		Pipelines            bool
@@ -438,6 +465,125 @@ func main() {
 	}
 	if scope.FileStore {
 		var failedFiles, failedOrgFiles, failedProjectFiles, failedServices []string
+
+		log.Infof(boldCyan.Sprintf("---Setting up Git Repository---"))
+
+		// First determine the repository URL and branch
+		var url string
+		if accountConfig.FileStoreConfig.RepositoryURL != "" {
+			url = accountConfig.FileStoreConfig.RepositoryURL
+			if !strings.Contains(url, ".git") {
+				url += ".git"
+			}
+		} else {
+			var err error
+			// Use empty org/project for account-level connector, or use FileStoreConfig values if provided
+			orgParam := ""
+			projectParam := ""
+			if accountConfig.FileStoreConfig.Organization != "" {
+				orgParam = accountConfig.FileStoreConfig.Organization
+			}
+			if accountConfig.FileStoreConfig.Project != "" {
+				projectParam = accountConfig.FileStoreConfig.Project
+			}
+
+			// Use the connector reference from GitDetails or FileStoreConfig
+			connectorRef := accountConfig.GitDetails.ConnectorRef
+			if accountConfig.FileStoreConfig.ConnectorRef != "" {
+				connectorRef = accountConfig.FileStoreConfig.ConnectorRef
+			}
+
+			log.Infof("Looking up connector: %s (org: %s, project: %s)", connectorRef, orgParam, projectParam)
+
+			conn, err := api.GetConnector(
+				accountConfig.AccountIdentifier,
+				orgParam,
+				projectParam,
+				connectorRef,
+			)
+			if err != nil {
+				log.Errorf(color.RedString("Unable to get connector - %s", err))
+				return
+			}
+
+			log.Infof("Retrieved connector: %s, URL: %s", conn.Name, conn.Spec.URL)
+
+			// Construct the full repository URL
+			baseURL := conn.Spec.URL
+			if !strings.HasSuffix(baseURL, "/") {
+				baseURL += "/"
+			}
+
+			// Add repository name if specified in GitDetails
+			if accountConfig.GitDetails.RepoName != "" {
+				url = baseURL + accountConfig.GitDetails.RepoName + ".git"
+				log.Infof("Constructed repository URL with repo name: %s", url)
+			} else {
+				// If no repo name, assume the connector URL already includes the repo
+				url = baseURL
+				if !strings.Contains(url, ".git") {
+					url += ".git"
+				}
+				log.Infof("Using connector URL directly: %s", url)
+			}
+			log.Infof("Final Git repository URL: %s", url)
+		}
+
+		// Determine the target branch
+		var branch string
+		if accountConfig.FileStoreConfig.Branch != "" {
+			branch = accountConfig.FileStoreConfig.Branch
+		} else {
+			log.Error(color.RedString("File Store branch is not set"))
+			return
+		}
+
+		// Remove existing filestore directory if it exists
+		if err := os.RemoveAll("./filestore"); err != nil {
+			log.Errorf(color.RedString("Unable to remove existing filestore directory - %s", err))
+			return
+		}
+
+		log.Infof("Cloning repository %s on branch %s...", url, branch)
+
+		var stderr bytes.Buffer
+		// Clone the repository with the specified branch
+		cmd := exec.Command("git", "clone", "--branch", branch, url, "./filestore")
+		cmd.Stderr, cmd.Stdout = &stderr, &stderr
+		err := cmd.Run()
+		if err != nil {
+			errorMessage := stderr.String()
+			// If branch doesn't exist, clone main/master and create the branch
+			if strings.Contains(errorMessage, "Remote branch") && strings.Contains(errorMessage, "not found") {
+				log.Warnf(color.YellowString("Branch %s does not exist, cloning default branch and creating it", branch))
+
+				// Clone without specifying branch (gets default branch)
+				cmd = exec.Command("git", "clone", url, "./filestore")
+				cmd.Stderr, cmd.Stdout = &stderr, &stderr
+				err = cmd.Run()
+				if err != nil {
+					log.Errorf(color.RedString("Unable to clone repository - Git Operations log:\n %s", stderr.String()))
+					return
+				}
+
+				// Create and checkout the new branch
+				cmd = exec.Command("git", "checkout", "-b", branch)
+				cmd.Dir = "./filestore"
+				cmd.Stderr, cmd.Stdout = &stderr, &stderr
+				err = cmd.Run()
+				if err != nil {
+					log.Errorf(color.RedString("Unable to create branch %s - Git Operations log:\n %s", branch, stderr.String()))
+					return
+				}
+				log.Infof("Created new branch %s", branch)
+			} else {
+				log.Errorf(color.RedString("Unable to clone repository - Git Operations log:\n %s", errorMessage))
+				return
+			}
+		}
+
+		log.Infof(color.GreenString("Successfully cloned repository on branch %s", branch))
+
 		log.Infof("Getting file store for account %s", accountConfig.AccountIdentifier)
 		accountFiles, err := api.GetAllAccountFiles(accountConfig.AccountIdentifier)
 		if err != nil {
@@ -524,41 +670,24 @@ func main() {
 			log.Warnf(color.HiYellowString("These files (count:%d) failed while downloading: \n%s", len(failedProjectFiles), strings.Join(failedProjectFiles, ",\n")))
 		}
 
-		log.Infof(boldCyan.Sprintf("---Creating Git Repo---"))
-		var stderr bytes.Buffer
-		// Init empty repo inside the filestore directory
-		cmd := exec.Command("git", "init")
-		cmd.Dir = "./filestore"
-		cmd.Stderr, cmd.Stdout = &stderr, &stderr
-		err = cmd.Run()
-		if err != nil {
-			log.Errorf(color.RedString("Unable to init git repo - %s", err))
-		}
+		log.Infof(boldCyan.Sprintf("---Committing and Pushing Changes---"))
 
-		// Set pull default to merge
-		cmd = exec.Command("git", "config", "pull.rebase", "false")
-		cmd.Dir = "./filestore"
-		cmd.Stderr, cmd.Stdout = &stderr, &stderr
-		err = cmd.Run()
-		if err != nil {
-			errorMessage := stderr.String()
-			log.Errorf(color.RedString("Unable to set git pull.rebase to false - Git Operations log:\n %s", errorMessage))
-		}
+		// Get the branch name that we set up earlier (reuse the variable from above)
+		// branch and stderr are already declared in the clone section above
 
-		log.Infof(color.GreenString("Git repo initialized"))
-		// Add files to git repo
+		// Now add the new filestore files to git
 		cmd = exec.Command("git", "add", ".")
 		cmd.Dir = "./filestore"
 		cmd.Stderr, cmd.Stdout = &stderr, &stderr
 		err = cmd.Run()
 		if err != nil {
-			log.Errorf(color.RedString("Unable to add files to git repo - Git Operations log:\n %s", err))
+			log.Errorf(color.RedString("Unable to add files to git repo - Git Operations log:\n %s", stderr.String()))
 			return
 		}
 		log.Info(color.GreenString("Files added to git repo"))
 
-		// Commit files to git repo
-		cmd = exec.Command("git", "commit", "-m", "Initial Filestore commit")
+		// Commit the filestore changes
+		cmd = exec.Command("git", "commit", "-m", "Update filestore data")
 		cmd.Dir = "./filestore"
 		cmd.Stderr, cmd.Stdout = &stderr, &stderr
 		err = cmd.Run()
@@ -567,95 +696,20 @@ func main() {
 			if !strings.Contains(errorMessage, "nothing to commit") {
 				log.Errorf("Unable to commit files to git repo - Git Operations log:\n %s", errorMessage)
 				return
-			}
-		}
-		log.Info(color.GreenString("Files committed to git repo"))
-
-		// Set remote url to git repo
-		var url string
-		if accountConfig.FileStoreConfig.RepositoryURL != "" {
-			url = accountConfig.FileStoreConfig.RepositoryURL
-			if !strings.Contains(url, ".git") {
-				url += ".git"
+			} else {
+				log.Info(color.GreenString("No changes to commit"))
 			}
 		} else {
-			var err error
-			conn, err := api.GetConnector(
-				accountConfig.AccountIdentifier,
-				accountConfig.FileStoreConfig.Organization,
-				accountConfig.FileStoreConfig.Project,
-				accountConfig.GitDetails.ConnectorRef,
-			)
-			if err != nil {
-				log.Errorf(color.RedString("Unable to get connector - %s", err))
-				return
-			}
-			url = conn.Spec.URL + ".git"
+			log.Info(color.GreenString("Files committed to git repo"))
 		}
 
-		cmd = exec.Command("git", "remote", "add", "origin", url)
-		cmd.Dir = "./filestore"
-		cmd.Stderr, cmd.Stdout = &stderr, &stderr
-		err = cmd.Run()
-		if err != nil {
-			errorMessage := stderr.String()
-			if !strings.Contains(errorMessage, "remote origin already exists.") {
-				log.Errorf("Unable to add remote origin to git repo - Git Operations log:\n %s", errorMessage)
-				return
-			}
-		}
-		log.Info(color.GreenString("Remote url set to git repo"))
-
-		// Push files to git repo
-		var branch string
-		if accountConfig.FileStoreConfig.Branch != "" {
-			branch = accountConfig.FileStoreConfig.Branch
-		} else {
-			log.Error(color.RedString("File Store branch is not set"))
-			return
-		}
-
-		// Check if branch exists
-		cmd = exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
-		cmd.Dir = "./filestore"
-		cmd.Stderr, cmd.Stdout = &stderr, &stderr
-		err = cmd.Run()
-		if err != nil {
-			log.Warnf(color.YellowString("Branch %s does not exist", branch))
-			log.Infof("Creating branch %s", branch)
-
-			// Create new branch
-			cmd = exec.Command("git", "checkout", "-b", branch)
-			cmd.Dir = "./filestore"
-			cmd.Stderr, cmd.Stdout = &stderr, &stderr
-
-			err = cmd.Run()
-			if err != nil {
-				log.Errorf(color.RedString("Unable to create branch %s - %s", branch, err))
-				return
-			}
-		}
-		log.Infof("Branch %s exists", branch)
-
-		cmd = exec.Command("git", "pull", "origin", branch, "--allow-unrelated-histories", "--no-ff")
-		cmd.Dir = "./filestore"
-		cmd.Stderr, cmd.Stdout = &stderr, &stderr
-		err = cmd.Run()
-		if err != nil {
-			errorMessage := stderr.String()
-			if !strings.Contains(errorMessage, "couldn't find remote ref") {
-				log.Errorf("Unable to pull from remote repo - Git Operations log:\n %s", errorMessage)
-				return
-			}
-		}
-
-		// Push files to git repo
+		// Push the changes to the remote repository
 		cmd = exec.Command("git", "push", "origin", branch)
 		cmd.Dir = "./filestore"
 		cmd.Stderr, cmd.Stdout = &stderr, &stderr
 		err = cmd.Run()
 		if err != nil {
-			log.Errorf(color.RedString("Unable to push files to git repo - Git Operations log:\n %s", err))
+			log.Errorf(color.RedString("Unable to push files to git repo - Git Operations log:\n %s", stderr.String()))
 			return
 		}
 		log.Info(color.GreenString("Files pushed to git repo!"))
@@ -666,11 +720,26 @@ func main() {
 			excludeServices = accountConfig.ExcludeServices
 
 			log.Infof(boldCyan.Sprintf("---Getting Connector Info---"))
+			// Use the same connector logic as the filestore URL construction
+			orgParam := ""
+			projectParam := ""
+			if accountConfig.FileStoreConfig.Organization != "" {
+				orgParam = accountConfig.FileStoreConfig.Organization
+			}
+			if accountConfig.FileStoreConfig.Project != "" {
+				projectParam = accountConfig.FileStoreConfig.Project
+			}
+
+			connectorRef := accountConfig.GitDetails.ConnectorRef
+			if accountConfig.FileStoreConfig.ConnectorRef != "" {
+				connectorRef = accountConfig.FileStoreConfig.ConnectorRef
+			}
+
 			conn, err := api.GetConnector(
 				accountConfig.AccountIdentifier,
-				accountConfig.FileStoreConfig.Organization,
-				accountConfig.FileStoreConfig.Project,
-				accountConfig.GitDetails.ConnectorRef,
+				orgParam,
+				projectParam,
+				connectorRef,
 			)
 			if err != nil {
 				log.Errorf("Unable to get Connector info - %s", err)
@@ -802,11 +871,26 @@ func main() {
 		if scope.Overrides {
 			log.Info(boldCyan.Sprintf("Processing Service overrides"))
 			log.Infof(boldCyan.Sprintf("---Getting Connector Info---"))
+			// Use the same connector logic as the filestore URL construction
+			orgParam := ""
+			projectParam := ""
+			if accountConfig.FileStoreConfig.Organization != "" {
+				orgParam = accountConfig.FileStoreConfig.Organization
+			}
+			if accountConfig.FileStoreConfig.Project != "" {
+				projectParam = accountConfig.FileStoreConfig.Project
+			}
+
+			connectorRef := accountConfig.GitDetails.ConnectorRef
+			if accountConfig.FileStoreConfig.ConnectorRef != "" {
+				connectorRef = accountConfig.FileStoreConfig.ConnectorRef
+			}
+
 			conn, err := api.GetConnector(
 				accountConfig.AccountIdentifier,
-				accountConfig.FileStoreConfig.Organization,
-				accountConfig.FileStoreConfig.Project,
-				accountConfig.GitDetails.ConnectorRef,
+				orgParam,
+				projectParam,
+				connectorRef,
 			)
 			if err != nil {
 				log.Errorf("Unable to get Connector info - %s", err)

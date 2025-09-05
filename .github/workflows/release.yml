@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Get build info
+        id: build_info
+        run: |
+          echo "VERSION=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+      
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # Set output filename with version
+          OUTPUT_NAME="harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT_NAME="${OUTPUT_NAME}.exe"
+          fi
+          
+          # Build with version info
+          LDFLAGS="-X 'main.Version=${{ steps.build_info.outputs.VERSION }}' -X 'main.GitCommit=${{ steps.build_info.outputs.GIT_COMMIT }}' -X 'main.BuildDate=${{ steps.build_info.outputs.BUILD_DATE }}'"
+          
+          echo "Building $OUTPUT_NAME with ldflags: $LDFLAGS"
+          go build -ldflags="$LDFLAGS" -o "$OUTPUT_NAME" .
+          
+          # Test the binary if it's Linux AMD64
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
+            echo "=== Testing Version Output ==="
+            ./"$OUTPUT_NAME" --version
+            echo ""
+          fi
+      
+      - name: Create archives and checksums
+        run: |
+          # Use the same filename pattern with version for the original binary
+          OUTPUT_NAME="harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT_NAME="${OUTPUT_NAME}.exe"
+          fi
+          
+          # Create a clean binary name for inside the archive
+          CLEAN_BINARY_NAME="harness-remote-migrator"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            CLEAN_BINARY_NAME="harness-remote-migrator.exe"
+          fi
+          
+          # Copy the binary with clean name for archiving
+          cp "$OUTPUT_NAME" "$CLEAN_BINARY_NAME"
+          
+          # Create archive based on platform
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            # Create ZIP for Windows
+            ARCHIVE_NAME="harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+            zip "$ARCHIVE_NAME" "$CLEAN_BINARY_NAME"
+          else
+            # Create tar.gz for Unix-like systems
+            ARCHIVE_NAME="harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+            tar -czf "$ARCHIVE_NAME" "$CLEAN_BINARY_NAME"
+          fi
+          
+          # Create checksums for both binary and archive
+          sha256sum "$OUTPUT_NAME" > "${OUTPUT_NAME}.sha256"
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          
+          # Clean up the temporary clean binary
+          rm "$CLEAN_BINARY_NAME"
+          
+          echo "Files created:"
+          ls -la "$OUTPUT_NAME"* "$ARCHIVE_NAME"*
+          echo ""
+          echo "Checksums:"
+          cat "${OUTPUT_NAME}.sha256"
+          cat "${ARCHIVE_NAME}.sha256"
+      
+      - name: Upload Binary Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          asset_name: harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          asset_content_type: application/octet-stream
+      
+      - name: Upload Binary Checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}.sha256
+          asset_name: harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}.sha256
+          asset_content_type: text/plain
+
+      - name: Upload Archive Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
+          asset_name: harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
+          asset_content_type: ${{ matrix.goos == 'windows' && 'application/zip' || 'application/gzip' }}
+
+      - name: Upload Archive Checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}.sha256
+          asset_name: harness-remote-migrator-${{ steps.build_info.outputs.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}.sha256
+          asset_content_type: text/plain
